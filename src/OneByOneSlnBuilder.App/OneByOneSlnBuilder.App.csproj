@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>OneByOneSlnBuilder</AssemblyName>
+    <RootNamespace>OneByOneSlnBuilder.App</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../OneByOneSlnBuilder.Core/OneByOneSlnBuilder.Core.csproj" />
+    <ProjectReference Include="../OneByOneSlnBuilder.Logger/OneByOneSlnBuilder.Logger.csproj" ReferenceOutputAssembly="false" Private="false" />
+    <None Include="../OneByOneSlnBuilder.Logger/bin/$(Configuration)/netstandard2.0/OneByOneSlnBuilder.Logger.dll"
+          Link="OneByOneSlnBuilder.Logger.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

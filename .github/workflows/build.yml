@@ -1,0 +1,32 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - run: dotnet run --project tests/OneByOneSlnBuilder.Tests -c Release
+      - run: dotnet build OneByOneSlnBuilder.sln -c Release
+      - name: Package Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: OneByOneSlnBuilder-win-x64
+          path: artifacts/OneByOneSlnBuilder-win-x64.zip
+          if-no-files-found: error
