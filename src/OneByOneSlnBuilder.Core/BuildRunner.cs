@@ -12,6 +12,8 @@ public sealed class BuildRunner
     public async Task<BuildReport> RunAsync(BuildOptions options, IProgress<BuildProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        if (options.MaxParallelBuilds is < 1 or > 16)
+            throw new ArgumentOutOfRangeException(nameof(options.MaxParallelBuilds), "同時ビルド数は1〜16を指定してください。");
         var root = Path.GetFullPath(options.RootDirectory);
         var output = Path.GetFullPath(options.OutputDirectory);
         var msbuild = Path.GetFullPath(options.MsBuildPath);
@@ -31,100 +33,66 @@ public sealed class BuildRunner
         Directory.CreateDirectory(run);
         var logs = Path.Combine(run, "logs");
         Directory.CreateDirectory(logs);
-        var results = new List<SolutionResult>();
+        var results = solutions.Select(solution => new SolutionResult(
+            Path.GetRelativePath(root, solution).Replace('\\', '/'),
+            "notRun", null, 0, 0, "", "中止のため未実行")).ToArray();
         var diagnostics = new HashSet<DiagnosticRecord>();
         var unmappedCount = 0;
         var cancelled = false;
         await File.WriteAllTextAsync(Path.Combine(run, "run.json"), JsonSerializer.Serialize(new
         {
             rootDirectory = root, startedAt = DateTimeOffset.Now, configuration = "Release", target = "Rebuild",
-            platform = options.Platform, options.IncludeWarnings, options.Restore, msBuildPath = msbuild,
+            platform = options.Platform, options.IncludeWarnings, options.Restore, options.MaxParallelBuilds, msBuildPath = msbuild,
             solutions = solutions.Select(s => Path.GetRelativePath(root, s).Replace('\\', '/'))
         }, JsonFormat.Options), Utf8);
 
-        for (var index = 0; index < solutions.Count; index++)
+        using var runCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var stateLock = new object();
+        var nextIndex = 0;
+        var finished = 0;
+        var running = 0;
+        async Task WorkerAsync()
         {
-            var solution = solutions[index];
-            var relative = Path.GetRelativePath(root, solution).Replace('\\', '/');
-            if (cancellationToken.IsCancellationRequested)
-            {
-                cancelled = true;
-                results.Add(new(relative, "notRun", null, 0, 0, "", "中止のため未実行"));
-                continue;
-            }
-            var stem = (index + 1).ToString("D4");
-            var logPath = Path.Combine(logs, stem + ".log");
-            var rawPath = Path.Combine(logs, stem + ".events.jsonl");
-            var unmappedPath = Path.Combine(logs, stem + ".unmapped.jsonl");
-            progress?.Report(new(index, solutions.Count, $"[{index + 1}/{solutions.Count}] {relative} をReleaseビルド中…"));
-            var startInfo = CreateStartInfo(options, msbuild, logger, solution, rawPath);
-            int? exitCode = null;
-            string? detail = null;
-            string status;
             try
             {
-                var outcome = await ExecuteAsync(startInfo, logPath, cancellationToken);
-                exitCode = outcome.ExitCode;
-                cancelled |= outcome.Cancelled;
-                status = outcome.Cancelled ? "cancelled" : exitCode == 0 ? "succeeded" : "failed";
-            }
-            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException)
-            {
-                status = "startFailed";
-                detail = ex.Message;
-                await File.AppendAllTextAsync(logPath, "\n実行エラー: " + ex + "\n", Utf8);
-            }
-            var count = 0;
-            var unmapped = 0;
-            var completed = false;
-            bool? succeeded = null;
-            try
-            {
-                if (File.Exists(rawPath))
+                while (true)
                 {
-                    using var reader = new StreamReader(rawPath, Utf8, true);
-                    using var rejected = new StreamWriter(unmappedPath, false, Utf8);
-                    while (await reader.ReadLineAsync() is { } line)
+                    int index;
+                    lock (stateLock)
                     {
-                        if (string.IsNullOrWhiteSpace(line)) continue;
-                        var item = JsonSerializer.Deserialize<RawDiagnostic>(line, JsonFormat.Options)
-                            ?? throw new JsonException("空の診断レコード");
-                        if (item.Kind == "buildFinished") { completed = true; succeeded = item.Succeeded; continue; }
-                        if (item.Kind != "error" && item.Kind != "warning") throw new JsonException("未知の診断レコード: " + item.Kind);
-                        if (item.Kind == "warning" && !options.IncludeWarnings) continue;
-                        if (DiagnosticMapper.TryMap(item, root, solution, out var mapped, out var reason))
-                        {
-                            diagnostics.Add(mapped!);
-                            count++;
-                        }
-                        else
-                        {
-                            unmapped++;
-                            await rejected.WriteLineAsync(JsonSerializer.Serialize(new { reason, diagnostic = item }, JsonFormat.Options));
-                        }
+                        if (runCancellation.IsCancellationRequested || nextIndex >= solutions.Count) return;
+                        index = nextIndex++;
+                        running++;
+                        progress?.Report(new(finished, solutions.Count,
+                            $"{results[index].Solution} をReleaseビルド中…", running));
+                    }
+                    var outcome = await BuildSolutionAsync(options, root, run, logs, msbuild, logger,
+                        solutions[index], index, runCancellation.Token);
+                    lock (stateLock)
+                    {
+                        // Index-based assignment keeps summary/log ordering independent of completion order.
+                        results[index] = outcome.Result;
+                        diagnostics.UnionWith(outcome.Diagnostics);
+                        unmappedCount += outcome.Result.UnmappedDiagnostics;
+                        cancelled |= outcome.Result.Status == "cancelled";
+                        running--;
+                        if (outcome.Result.Status != "notRun") finished++;
+                        progress?.Report(new(finished, solutions.Count,
+                            $"{outcome.Result.Solution}: {StatusText(outcome.Result.Status)} / 診断 {outcome.Result.ExportedDiagnostics}件、取り込み対象外 {outcome.Result.UnmappedDiagnostics}件",
+                            running));
                     }
                 }
-                if (status != "cancelled" && status != "startFailed" && (!completed || succeeded == null))
-                {
-                    status = "incomplete";
-                    detail = "診断ロガーの完了を確認できません。ビルドログを確認してください。";
-                }
-                else if (succeeded == false && status == "succeeded")
-                {
-                    status = "failed";
-                    detail = "MSBuildからビルド失敗が報告されました。";
-                }
             }
-            catch (Exception ex) when (ex is IOException or JsonException)
+            catch
             {
-                if (status != "cancelled") status = "incomplete";
-                detail = "診断ログを最後まで読めません: " + ex.Message;
+                // Stop siblings on an unexpected infrastructure failure, then await every worker below.
+                // Ordinary build failures are returned as results and never cancel the queue.
+                await runCancellation.CancelAsync();
+                throw;
             }
-            unmappedCount += unmapped;
-            results.Add(new(relative, status, exitCode, count, unmapped, Path.GetRelativePath(run, logPath).Replace('\\', '/'), detail));
-            progress?.Report(new(index + 1, solutions.Count,
-                $"{relative}: {StatusText(status)} / 診断 {count}件、取り込み対象外 {unmapped}件"));
         }
+        await Task.WhenAll(Enumerable.Range(0, Math.Min(options.MaxParallelBuilds, solutions.Count))
+            .Select(_ => WorkerAsync()));
         // A cancelled run never produces a file named diagnostics.jsonl.
         cancelled |= cancellationToken.IsCancellationRequested;
         string? diagnosticsFile = null;
@@ -164,6 +132,86 @@ public sealed class BuildRunner
         if (exportError != null) throw new InvalidOperationException(exportError + "\nログ保存先: " + run);
         progress?.Report(new(results.Count(r => r.Status != "notRun"), solutions.Count, cancelled ? "中止しました。" : "処理が完了しました。"));
         return report;
+    }
+
+    private static async Task<(SolutionResult Result, HashSet<DiagnosticRecord> Diagnostics)> BuildSolutionAsync(
+        BuildOptions options, string root, string run, string logs, string msbuild, string logger,
+        string solution, int index, CancellationToken cancellationToken)
+    {
+        var relative = Path.GetRelativePath(root, solution).Replace('\\', '/');
+        var diagnostics = new HashSet<DiagnosticRecord>();
+        var stem = (index + 1).ToString("D4");
+        var logPath = Path.Combine(logs, stem + ".log");
+        var rawPath = Path.Combine(logs, stem + ".events.jsonl");
+        var unmappedPath = Path.Combine(logs, stem + ".unmapped.jsonl");
+        var startInfo = CreateStartInfo(options, msbuild, logger, solution, rawPath);
+        int? exitCode = null;
+        string? detail = null;
+        string status;
+        try
+        {
+            var outcome = await ExecuteAsync(startInfo, logPath, cancellationToken);
+            exitCode = outcome.ExitCode;
+            status = outcome.Cancelled ? "cancelled" : exitCode == 0 ? "succeeded" : "failed";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return (new(relative, "notRun", null, 0, 0, "", "中止のため未実行"), diagnostics);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException)
+        {
+            status = "startFailed";
+            detail = ex.Message;
+            await File.AppendAllTextAsync(logPath, "\n実行エラー: " + ex + "\n", Utf8);
+        }
+        var count = 0;
+        var unmapped = 0;
+        var completed = false;
+        bool? succeeded = null;
+        try
+        {
+            if (File.Exists(rawPath))
+            {
+                using var reader = new StreamReader(rawPath, Utf8, true);
+                using var rejected = new StreamWriter(unmappedPath, false, Utf8);
+                while (await reader.ReadLineAsync() is { } line)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var item = JsonSerializer.Deserialize<RawDiagnostic>(line, JsonFormat.Options)
+                        ?? throw new JsonException("空の診断レコード");
+                    if (item.Kind == "buildFinished") { completed = true; succeeded = item.Succeeded; continue; }
+                    if (item.Kind != "error" && item.Kind != "warning") throw new JsonException("未知の診断レコード: " + item.Kind);
+                    if (item.Kind == "warning" && !options.IncludeWarnings) continue;
+                    if (DiagnosticMapper.TryMap(item, root, solution, out var mapped, out var reason))
+                    {
+                        diagnostics.Add(mapped!);
+                        count++;
+                    }
+                    else
+                    {
+                        unmapped++;
+                        await rejected.WriteLineAsync(JsonSerializer.Serialize(new { reason, diagnostic = item }, JsonFormat.Options));
+                    }
+                }
+            }
+            if (status != "cancelled" && status != "startFailed" && (!completed || succeeded == null))
+            {
+                status = "incomplete";
+                detail = "診断ロガーの完了を確認できません。ビルドログを確認してください。";
+            }
+            else if (succeeded == false && status == "succeeded")
+            {
+                status = "failed";
+                detail = "MSBuildからビルド失敗が報告されました。";
+            }
+        }
+        catch (Exception ex) when (ex is IOException or JsonException)
+        {
+            if (status != "cancelled") status = "incomplete";
+            detail = "診断ログを最後まで読めません: " + ex.Message;
+        }
+        return (new(relative, status, exitCode, count, unmapped,
+            Path.GetRelativePath(run, logPath).Replace('\\', '/'), detail), diagnostics);
     }
 
     private static List<string> DiscoverSolutions(string root, CancellationToken cancellationToken)
@@ -220,23 +268,42 @@ public sealed class BuildRunner
         log.WriteLine("Arguments: " + string.Join(" ", start.ArgumentList.Select(a => "\"" + a + "\"")));
         log.WriteLine("Working directory: " + start.WorkingDirectory);
         using var process = new Process { StartInfo = start };
+        using var processCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        token.ThrowIfCancellationRequested();
         process.Start();
         var sync = new object();
         async Task PumpAsync(StreamReader reader, string prefix)
         {
-            while (await reader.ReadLineAsync() is { } line)
-                lock (sync) log.WriteLine(prefix + line);
+            try
+            {
+                while (await reader.ReadLineAsync() is { } line)
+                    lock (sync) log.WriteLine(prefix + line);
+            }
+            catch
+            {
+                // A failed output writer must not leave a child blocked on a full redirected pipe.
+                await processCancellation.CancelAsync();
+                throw;
+            }
         }
         var stdout = PumpAsync(process.StandardOutput, "");
         var stderr = PumpAsync(process.StandardError, "[stderr] ");
         var cancelled = false;
-        try { await process.WaitForExitAsync(token); }
+        try { await process.WaitForExitAsync(processCancellation.Token); }
         catch (OperationCanceledException)
         {
-            cancelled = true;
+            cancelled = token.IsCancellationRequested;
             try { process.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { }
             await process.WaitForExitAsync();
+        }
+        catch
+        {
+            try { process.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            await process.WaitForExitAsync();
+            try { await Task.WhenAll(stdout, stderr); } catch { /* Preserve the process-wait error. */ }
+            throw;
         }
         await Task.WhenAll(stdout, stderr);
         return (process.ExitCode, cancelled);
@@ -244,6 +311,6 @@ public sealed class BuildRunner
     private static string StatusText(string value) => value switch
     {
         "succeeded" => "成功", "failed" => "失敗", "incomplete" => "診断の取得が不完全",
-        "startFailed" => "実行エラー", "cancelled" => "中止", _ => value
+        "startFailed" => "実行エラー", "cancelled" => "中止", "notRun" => "未実行", _ => value
     };
 }

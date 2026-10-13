@@ -5,13 +5,15 @@ using OneByOneSlnBuilder.Core;
 
 namespace OneByOneSlnBuilder.Tests;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private static readonly string[] AllowedFields = ["file", "message", "line", "code"];
 
     public static async Task<int> Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--wait-child")
+            return await RunFakeChildAsync(args[1], args[2]);
         if (args.Length > 0 && Path.GetExtension(args[0]).Equals(".sln", StringComparison.OrdinalIgnoreCase))
             return await RunFakeMsBuildAsync(args);
 
@@ -27,6 +29,9 @@ internal static class Program
             ("Runner can omit warnings and reports zero diagnostics without a stale file", RunnerOmitsWarnings),
             ("Runner marks missing logger completion as incomplete", RunnerDetectsMissingCompletion),
             ("Runner cancellation kills the process and preserves only partial diagnostics", RunnerCancellation),
+            ("Parallel runner overlaps work within its limit and aggregates in discovery order", RunnerParallelismAndDeterministicOutput),
+            ("Parallel cancellation kills every running process tree and leaves queued solutions unstarted", RunnerParallelCancellation),
+            ("Runner rejects concurrency limits outside 1 through 16", RunnerRejectsInvalidParallelism),
             ("Runner rejects an empty solution directory", RunnerRejectsEmptyDirectory)
         ];
         var failed = 0;
@@ -255,7 +260,7 @@ internal static class Program
         var solution = WriteFixture(temp, "root/A.sln", new FakeBuild { DelayMilliseconds = 30000, Diagnostics = [new() { Kind = "error", File = source, Message = "partial evidence" }] });
         WriteFixture(temp, "root/B.sln", new FakeBuild());
         using var cancellation = new CancellationTokenSource();
-        var task = new BuildRunner().RunAsync(new(root, Path.Combine(temp.Path, "output"), FakeExecutable(), LoggerPath()), cancellationToken: cancellation.Token);
+        var task = new BuildRunner().RunAsync(new(root, Path.Combine(temp.Path, "output"), FakeExecutable(), LoggerPath(), MaxParallelBuilds: 1), cancellationToken: cancellation.Token);
         var timeout = Stopwatch.StartNew();
         while (!File.Exists(solution + ".started"))
         {
@@ -307,6 +312,9 @@ internal static class Program
         await File.WriteAllTextAsync(args[0] + ".arguments.json", JsonSerializer.Serialize(args));
         var loggerArgument = args.Single(arg => arg.StartsWith("/logger:", StringComparison.Ordinal));
         var output = Encoding.UTF8.GetString(Convert.FromBase64String(loggerArgument[(loggerArgument.LastIndexOf(';') + 1)..]));
+        await WriteProcessIdAsync(args[0] + ".pid");
+        await RecordFakeLifecycleAsync(fixture, args[0], "started");
+        using var child = await StartFakeChildAsync(fixture, args[0]);
         await using (var writer = new StreamWriter(output, false, new UTF8Encoding(false)))
         {
             foreach (var diagnostic in fixture.Diagnostics)
@@ -315,10 +323,13 @@ internal static class Program
             await File.WriteAllTextAsync(args[0] + ".started", "started");
             Console.WriteLine("fake MSBuild stdout");
             Console.Error.WriteLine("environment stderr");
+            if (fixture.ReleaseGate != null) await WaitForFakeGateAsync(fixture.ReleaseGate);
             if (fixture.DelayMilliseconds > 0) await Task.Delay(fixture.DelayMilliseconds);
             if (!fixture.OmitCompletion)
                 await writer.WriteLineAsync(JsonSerializer.Serialize(new { kind = "buildFinished", succeeded = fixture.ExitCode == 0 }, JsonOptions));
         }
+        await RecordFakeLifecycleAsync(fixture, args[0], "finished");
+        await File.WriteAllTextAsync(args[0] + ".ended", "finished");
         return fixture.ExitCode;
     }
 
@@ -345,6 +356,9 @@ internal static class Program
         public int ExitCode { get; set; }
         public int DelayMilliseconds { get; set; }
         public bool OmitCompletion { get; set; }
+        public string? ReleaseGate { get; set; }
+        public string? LifecycleDirectory { get; set; }
+        public bool SpawnChild { get; set; }
         public RawDiagnostic[] Diagnostics { get; set; } = [];
     }
 }

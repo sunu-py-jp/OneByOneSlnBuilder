@@ -4,8 +4,8 @@ using System.Text.Json.Serialization;
 namespace OneByOneSlnBuilder.Core;
 
 public sealed record BuildOptions(string RootDirectory, string OutputDirectory, string MsBuildPath,
-    string LoggerPath, string? Platform = null, bool IncludeWarnings = true, bool Restore = true);
-public sealed record BuildProgress(int Completed, int Total, string Message);
+    string LoggerPath, string? Platform = null, bool IncludeWarnings = true, bool Restore = true, int MaxParallelBuilds = 2);
+public sealed record BuildProgress(int Completed, int Total, string Message, int Running = 0);
 public sealed record SolutionResult(string Solution, string Status, int? ExitCode,
     int ExportedDiagnostics, int UnmappedDiagnostics, string LogFile, string? Detail = null);
 public sealed record BuildReport(string RootDirectory, string RunDirectory, string? DiagnosticsFile,

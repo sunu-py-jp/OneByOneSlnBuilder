@@ -10,6 +10,10 @@ internal sealed class MainForm : Form
     private readonly TextBox _output = new() { Dock = DockStyle.Fill };
     private readonly TextBox _msBuild = new() { Dock = DockStyle.Fill };
     private readonly TextBox _platform = new() { Width = 230, PlaceholderText = "空欄: ソリューションの既定値" };
+    private readonly NumericUpDown _parallelBuilds = new()
+    {
+        Minimum = 1, Maximum = 16, Value = 2, Width = 65, AccessibleName = "同時ビルド数"
+    };
     private readonly CheckBox _warnings = new() { AutoSize = true, Checked = true, Text = "警告も診断に含める" };
     private readonly CheckBox _restore = new() { AutoSize = true, Checked = true, Text = "ビルド前にパッケージを復元する" };
     private readonly Button _start = new() { AutoSize = true, Text = "Release ビルド開始", Padding = new Padding(14, 7, 14, 7) };
@@ -31,6 +35,7 @@ internal sealed class MainForm : Form
     private CancellationTokenSource? _buildCts;
     private string? _automaticOutput;
     private BuildReport? _report;
+    private BuildProgress? _lastProgress;
     private bool _closeRequested;
 
     public MainForm()
@@ -58,7 +63,7 @@ internal sealed class MainForm : Form
         };
         var introduction = new Label
         {
-            Text = "フォルダ内の .sln を順番に Release ビルドし、OneByOneMigration 用の診断 JSONL を出力します。\n対象フォルダは OneByOneMigration と同じルートを指定してください。",
+            Text = "フォルダ内の .sln を並列に Release ビルドし、OneByOneMigration 用の診断 JSONL を出力します。\n対象フォルダは OneByOneMigration と同じルートを指定してください。",
             AutoSize = true, Margin = new Padding(0, 0, 0, 8)
         };
         layout.Controls.Add(title, 0, 0);
@@ -106,6 +111,8 @@ internal sealed class MainForm : Form
         var options = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0, 6, 0, 0) };
         options.Controls.Add(new Label { Text = "Platform", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
         options.Controls.Add(_platform);
+        options.Controls.Add(new Label { Text = "同時ビルド数", AutoSize = true, Margin = new Padding(20, 6, 8, 0) });
+        options.Controls.Add(_parallelBuilds);
         _settings.Controls.Add(options, 0, 3);
         _settings.SetColumnSpan(options, 3);
         var checkboxes = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 6, 0, 0) };
@@ -114,6 +121,14 @@ internal sealed class MainForm : Form
         checkboxes.Controls.AddRange([_warnings, _restore]);
         _settings.Controls.Add(checkboxes, 0, 4);
         _settings.SetColumnSpan(checkboxes, 3);
+        var parallelHelp = new Label
+        {
+            Text = "1 は順次実行。同じプロジェクトや出力先（bin / obj など）を共有する場合は、1 にしてください。",
+            AutoSize = true, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(71, 85, 105),
+            Margin = new Padding(0, 6, 0, 0)
+        };
+        _settings.Controls.Add(parallelHelp, 0, 5);
+        _settings.SetColumnSpan(parallelHelp, 3);
         return _settings;
     }
 
@@ -202,7 +217,8 @@ internal sealed class MainForm : Form
             var logger = Path.Combine(AppContext.BaseDirectory, "OneByOneSlnBuilder.Logger.dll");
             if (!File.Exists(logger)) throw new FileNotFoundException("診断ロガーが見つかりません。配布 ZIP をすべて展開して起動してください。", logger);
             options = new BuildOptions(root, output, msBuild, logger,
-                string.IsNullOrWhiteSpace(_platform.Text) ? null : _platform.Text.Trim(), _warnings.Checked, _restore.Checked);
+                string.IsNullOrWhiteSpace(_platform.Text) ? null : _platform.Text.Trim(), _warnings.Checked, _restore.Checked,
+                MaxParallelBuilds: (int)_parallelBuilds.Value);
         }
         catch (Exception ex)
         {
@@ -211,6 +227,7 @@ internal sealed class MainForm : Form
         }
 
         _report = null;
+        _lastProgress = null;
         _buildCts = new CancellationTokenSource();
         _logLines.Clear();
         _log.Clear();
@@ -222,6 +239,7 @@ internal sealed class MainForm : Form
         AppendLog($"対象: {options.RootDirectory}");
         AppendLog($"出力先: {options.OutputDirectory}");
         AppendLog($"構成: Release / Platform: {options.Platform ?? "ソリューションの既定値"}");
+        AppendLog($"同時ビルド数: {options.MaxParallelBuilds}");
         _status.Text = "ソリューションを検索しています…";
         var progress = new Progress<BuildProgress>(update =>
         {
@@ -229,7 +247,10 @@ internal sealed class MainForm : Form
             _progress.Style = ProgressBarStyle.Blocks;
             _progress.Maximum = Math.Max(1, update.Total);
             _progress.Value = Math.Clamp(update.Completed, 0, _progress.Maximum);
-            if (!_buildCts.IsCancellationRequested) _status.Text = update.Message;
+            _lastProgress = update;
+            _status.Text = FormatProgressPrefix(update) + (_buildCts.IsCancellationRequested
+                ? "キャンセル中… 実行中のすべてのビルドを停止しています。"
+                : update.Message);
             AppendLog(update.Message);
         });
         try
@@ -293,7 +314,7 @@ internal sealed class MainForm : Form
     {
         if (_buildCts is null || _buildCts.IsCancellationRequested) return;
         _cancel.Enabled = false;
-        _status.Text = "キャンセル中… 現在のビルド プロセスを停止しています。";
+        _status.Text = FormatProgressPrefix(_lastProgress) + "キャンセル中… 実行中のすべてのビルドを停止しています。";
         AppendLog(_status.Text);
         _buildCts.Cancel();
     }
@@ -335,6 +356,10 @@ internal sealed class MainForm : Form
 
     private void ShowError(string title, Exception error) =>
         MessageBox.Show(this, error.Message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+    private static string FormatProgressPrefix(BuildProgress? progress) => progress is null
+        ? ""
+        : $"完了 {progress.Completed} / {progress.Total} 件・実行中 {progress.Running} 件  ";
 
     private static string CleanPath(string value) => value.Trim().Trim('"');
 
